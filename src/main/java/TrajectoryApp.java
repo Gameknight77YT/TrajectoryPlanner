@@ -436,7 +436,6 @@ public class TrajectoryApp extends Application {
     private TableView<TrajectoryResult> table;
     private ObservableList<TrajectoryResult> masterData = FXCollections.observableArrayList();
     private ScatterChart<Number, Number> porkchopChart;
-    private Canvas canvas;
     private CelestialBody currentOrigin;
     private CelestialBody currentTarget;
     private CelestialBody currentHCP; // Highest Common Parent
@@ -448,6 +447,15 @@ public class TrajectoryApp extends Application {
     private Orbit currentOriginOrbit;
     private Orbit currentTargetOrbit;
 
+    // --- VIEWPORT & STATE VARIABLES ---
+    private Canvas canvas;
+    private double panX = 0.0;
+    private double panY = 0.0;
+    private double zoomFactor = 1.0;
+    private double lastMouseX = 0.0;
+    private double lastMouseY = 0.0;
+    private TrajectoryResult currentDisplayRoute = null; // Caches the route so we can redraw it while zooming
+    private TextArea overviewArea;
 
 
     @Override
@@ -627,17 +635,23 @@ public class TrajectoryApp extends Application {
     }
 
     private void drawFlightPath(TrajectoryResult res) {
+        // Cache the route so pan/zoom listeners can trigger redraws
+        currentDisplayRoute = res;
+
         GraphicsContext gc = canvas.getGraphicsContext2D();
-        gc.clearRect(0, 0, canvas.getWidth(), canvas.getHeight());
-        // Paint the background black
+
+        // Failsafe: If canvas hasn't sized yet, assume a default size so the black background paints
+        double w = canvas.getWidth() > 0 ? canvas.getWidth() : 800;
+        double h = canvas.getHeight() > 0 ? canvas.getHeight() : 800;
+
         gc.setFill(Color.BLACK);
-        gc.fillRect(0, 0, canvas.getWidth(), canvas.getHeight());
+        gc.fillRect(0, 0, w, h);
 
-        double cx = canvas.getWidth() / 2.0;
-        double cy = canvas.getHeight() / 2.0;
+        // Apply Camera Pan
+        double cx = (w / 2.0) + panX;
+        double cy = (h / 2.0) + panY;
 
-        // --- 1. FAILSAFES & SCALE CALCULATION ---
-        if (currentHCP == null) currentHCP = bodiesMap.get("Sun"); // Failsafe for Reset View
+        if (currentHCP == null) currentHCP = bodiesMap.get("Sun");
 
         double maxDist = 0;
         List<CelestialBody> pathBodies = new ArrayList<>();
@@ -660,14 +674,15 @@ public class TrajectoryApp extends Application {
                 tofs = new double[] {0.0, res.getTofDays() * 21600.0};
             }
         } else {
-            // Default Scale for "Reset View" (Zooms out to Jool)
             maxDist = bodiesMap.containsKey("Jool") ? bodiesMap.get("Jool").sma * 1.1 : 1E11;
         }
 
-        if (maxDist <= 0) maxDist = 1E11; // Absolute failsafe
-        double scale = (Math.min(cx, cy) - 60) / maxDist;
+        if (maxDist <= 0) maxDist = 1E11;
 
-        // Identify interacted bodies to highlight them
+        // Apply Camera Zoom
+        double baseScale = (Math.min(w, h) / 2.0 - 60) / maxDist;
+        double scale = baseScale * zoomFactor;
+
         Set<String> activeBodies = new HashSet<>();
         if (res != null) {
             for (CelestialBody b : pathBodies) activeBodies.add(b.name);
@@ -677,7 +692,7 @@ public class TrajectoryApp extends Application {
             }
         }
 
-        // --- 2. DRAW BACKGROUND SOLAR SYSTEM ---
+        // --- DRAW BACKGROUND SOLAR SYSTEM ---
         AbsoluteDate baseDate = (res != null) ? res.depDate : KSP_EPOCH;
 
         for (CelestialBody body : bodiesMap.values()) {
@@ -692,7 +707,6 @@ public class TrajectoryApp extends Application {
 
             gc.beginPath();
             if (!isMoon) {
-                // FIXED: Use Integer loop to prevent floating-point UI freezes!
                 if (body.period > 0) {
                     int segments = 120;
                     double step = body.period / segments;
@@ -700,8 +714,8 @@ public class TrajectoryApp extends Application {
                         double t = j * step;
                         try {
                             Vector3D pos = getPVRelativeTo(body, currentHCP, KSP_EPOCH.shiftedBy(t)).getPosition();
-                            double x = cx + (pos.getX() * scale); double y = cy + (pos.getY() * scale);
-                            if (j == 0) gc.moveTo(x, y); else gc.lineTo(x, y);
+                            double px = cx + (pos.getX() * scale); double py = cy + (pos.getY() * scale);
+                            if (j == 0) gc.moveTo(px, py); else gc.lineTo(px, py);
                         } catch (Exception ignored) {}
                     }
                 }
@@ -720,7 +734,6 @@ public class TrajectoryApp extends Application {
             }
             gc.stroke();
 
-            // Draw the planet/moon dot
             try {
                 Vector3D pos = getPVRelativeTo(body, currentHCP, baseDate).getPosition();
                 double bx = cx + (pos.getX() * scale); double by = cy + (pos.getY() * scale);
@@ -737,8 +750,8 @@ public class TrajectoryApp extends Application {
             } catch (Exception ignored) {}
         }
 
-        // --- 3. DRAW TRAJECTORY ARCS (Only if a route is selected) ---
-        if (res == null || pathBodies.size() < 2) return; // Stop drawing if it's just a Reset View
+        // --- DRAW TRAJECTORY ARCS ---
+        if (res == null || pathBodies.size() < 2) return;
 
         gc.setLineWidth(2.5);
         AbsoluteDate currentDate = res.depDate;
@@ -765,7 +778,6 @@ public class TrajectoryApp extends Application {
                 gc.setStroke(i % 2 == 0 ? Color.CYAN : Color.MAGENTA);
                 gc.beginPath();
 
-                // FIXED: Use Integer loop for safe UI rendering!
                 int segments = 150;
                 double step = tof / segments;
                 double prevX = 0, prevY = 0;
@@ -777,21 +789,21 @@ public class TrajectoryApp extends Application {
                     Vector3D craftPos = transfer.getPVCoordinates(stepDate, EME).getPosition();
                     Vector3D absolutePos = legHcpPos.add(craftPos);
 
-                    double x = cx + (absolutePos.getX() * scale); double y = cy + (absolutePos.getY() * scale);
+                    double px = cx + (absolutePos.getX() * scale); double py = cy + (absolutePos.getY() * scale);
 
                     if (j == 0) {
-                        gc.moveTo(x, y);
-                        prevX = x; prevY = y;
-                        if (i == 0) { originX = x; originY = y; }
+                        gc.moveTo(px, py);
+                        prevX = px; prevY = py;
+                        if (i == 0) { originX = px; originY = py; }
                     } else {
-                        gc.lineTo(x, y);
-                        if (i == 0 && j == 2) { // Use the 2nd segment to calculate ejection vector
-                            double dx = x - originX; double dy = y - originY;
+                        gc.lineTo(px, py);
+                        if (i == 0 && j == 2) {
+                            double dx = px - originX; double dy = py - originY;
                             double mag = Math.sqrt(dx*dx + dy*dy);
                             ejectNodeX = originX + (dx/mag) * 12;
                             ejectNodeY = originY + (dy/mag) * 12;
                         }
-                        prevX = x; prevY = y;
+                        prevX = px; prevY = py;
                     }
                 }
                 gc.stroke();
@@ -824,7 +836,7 @@ public class TrajectoryApp extends Application {
             currentDate = nextDate;
         }
 
-        // --- 4. DRAW STYLIZED UI MANEUVER NODES ---
+        // --- DRAW STYLIZED UI MANEUVER NODES ---
         gc.setLineWidth(1.5);
         gc.setLineDashes(3);
 
@@ -919,13 +931,6 @@ public class TrajectoryApp extends Application {
         }
         return bestResult;
     }
-
-    private double zoomLevel = 1.0;
-    private double offsetX = 0.0;
-    private double offsetY = 0.0;
-    private double lastMouseX = 0.0;
-    private double lastMouseY = 0.0;
-    private TextArea overviewArea;
 
     @Override
     public void start(Stage stage) {
@@ -1108,9 +1113,9 @@ public class TrajectoryApp extends Application {
 
         Button resetZoomBtn = new Button("Reset View");
         resetZoomBtn.setOnAction(e -> {
-            zoomLevel = 1.0;
-            offsetX = 0.0;
-            offsetY = 0.0;
+            zoomFactor = 1.0;
+            panX = 0.0;
+            panY = 0.0;
             TrajectoryResult sel = table.getSelectionModel().getSelectedItem();
             if (sel != null) drawFlightPath(sel);
         });
@@ -1120,38 +1125,26 @@ public class TrajectoryApp extends Application {
 
         canvas = new Canvas(450, 450);
 
-        // Scroll wheel zooming
-        canvas.setOnScroll(event -> {
-            if (event.getDeltaY() > 0) {
-                zoomLevel *= 1.1;
-            } else if (event.getDeltaY() < 0) {
-                zoomLevel /= 1.1;
-            }
-            zoomLevel = Math.max(0.01, Math.min(zoomLevel, 5000.0));
-
-            TrajectoryResult sel = table.getSelectionModel().getSelectedItem();
-            if (sel != null) drawFlightPath(sel);
+        // --- 1. MOUSE CONTROLS (PAN & ZOOM) ---
+        canvas.setOnScroll(e -> {
+            if (e.getDeltaY() == 0) return;
+            // Scroll up = zoom in (1.1x), Scroll down = zoom out (0.9x)
+            double scaleFactor = (e.getDeltaY() > 0) ? 1.1 : 0.9;
+            zoomFactor *= scaleFactor;
+            drawFlightPath(currentDisplayRoute);
         });
 
-        // NEW: Record mouse start position for dragging
-        canvas.setOnMousePressed(event -> {
-            lastMouseX = event.getX();
-            lastMouseY = event.getY();
+        canvas.setOnMousePressed(e -> {
+            lastMouseX = e.getX();
+            lastMouseY = e.getY();
         });
 
-        // NEW: Calculate drag distance and apply to offsets
-        canvas.setOnMouseDragged(event -> {
-            double deltaX = event.getX() - lastMouseX;
-            double deltaY = event.getY() - lastMouseY;
-
-            offsetX += deltaX;
-            offsetY += deltaY;
-
-            lastMouseX = event.getX();
-            lastMouseY = event.getY();
-
-            TrajectoryResult sel = table.getSelectionModel().getSelectedItem();
-            if (sel != null) drawFlightPath(sel);
+        canvas.setOnMouseDragged(e -> {
+            panX += (e.getX() - lastMouseX);
+            panY += (e.getY() - lastMouseY);
+            lastMouseX = e.getX();
+            lastMouseY = e.getY();
+            drawFlightPath(currentDisplayRoute);
         });
 
         // NEW: Click-to-focus on planets
@@ -1165,8 +1158,8 @@ public class TrajectoryApp extends Application {
                 double maxDist = getPVRelativeTo(currentTarget, currentHCP, res.arrDate).getPosition().getNorm();
 
                 // Calculate current scale to find where the planets are currently drawn on screen
-                double currentScale = ((w / 2.2) / maxDist) * zoomLevel;
-                double cx = (w / 2) + offsetX; double cy = (h / 2) + offsetY;
+                double currentScale = ((w / 2.2) / maxDist) * zoomFactor;
+                double cx = (w / 2) + panX; double cy = (h / 2) + panY;
 
                 // Re-gather the family tree to check hitboxes
                 Set<CelestialBody> targetBranch = new HashSet<>();
@@ -1198,15 +1191,15 @@ public class TrajectoryApp extends Application {
                 // If we clicked a planet, snap the camera and zoom in!
                 if (clickedBody != null) {
                     // Bump the zoom level significantly (cap it at 5000)
-                    zoomLevel = Math.max(zoomLevel * 3.0, 15.0);
-                    zoomLevel = Math.min(zoomLevel, 5000.0);
+                    zoomFactor = Math.max(zoomFactor * 3.0, 15.0);
+                    zoomFactor = Math.min(zoomFactor, 5000.0);
 
                     // Calculate the NEW scale after zooming
-                    double newScale = ((w / 2.2) / maxDist) * zoomLevel;
+                    double newScale = ((w / 2.2) / maxDist) * zoomFactor;
 
                     // Set offsets so that the clicked planet's coordinate becomes the new exact center (w/2, h/2)
-                    offsetX = -(clickedPos.getX() * newScale);
-                    offsetY = -(clickedPos.getY() * newScale);
+                    panX = -(clickedPos.getX() * newScale);
+                    panY = -(clickedPos.getY() * newScale);
 
                     drawFlightPath(res);
                 }
@@ -1224,8 +1217,17 @@ public class TrajectoryApp extends Application {
         splitPane.setDividerPositions(0.5);
 
         // --- Listeners ---
-        table.getSelectionModel().selectedItemProperty().addListener((obs, old, newSel) -> {
-            if (newSel != null) displayTrajectory(newSel);
+
+        table.getSelectionModel().selectedItemProperty().addListener((obs, oldVal, newVal) -> {
+            if (newVal != null) {
+                // Reset the camera view when a new route is clicked
+                panX = 0.0;
+                panY = 0.0;
+                zoomFactor = 1.0;
+
+                // Update the text box and draw the map
+                displayTrajectory(newVal);
+            }
         });
 
         calcBtn.setOnAction(e -> {
